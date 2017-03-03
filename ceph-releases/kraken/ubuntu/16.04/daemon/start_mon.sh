@@ -1,5 +1,71 @@
 #!/bin/bash
 set -e
+set -x
+
+IPV4_REGEXP='[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}'
+IPV4_NETWORK_REGEXP="$IPV4_REGEXP/[0-9]\{1,2\}"
+
+function flat_to_ipv6 {
+  # Get a flat input like fe800000000000000042acfffe110003 and output fe80::0042:acff:fe11:0003
+  # This input usually comes from the ipv6_route or if_inet6 files from /proc
+  input=$@
+  value=""
+  for item in $(echo $input | grep -o ....); do
+    if [ -z $value ]; then
+      value="$item";
+     else
+      value="$value:$item";
+    fi;
+  done
+
+  # Let's remove the useless 0000 and "::"
+  value=${value//0000/:};
+  while $(echo $value | grep -q ":::"); do
+    value=${value//::/:};
+  done
+  echo $value
+}
+
+function get_ip {
+  # IPv4 is the default unless we specify it
+  IP_LEVEL=${1:-4}
+  if command -v ip &>/dev/null; then
+    ip -$IP_LEVEL -o a s $NIC_MORE_TRAFFIC | awk '{ sub ("/..", "", $4); print $4 }'
+  else
+    case "$IP_LEVEL" in
+      6)
+        ip=$(flat_to_ipv6 $(grep $NIC_MORE_TRAFFIC /proc/net/if_inet6 | awk '{print $1}'))
+        # IPv6 IPs should be surrounded by brackets to let ceph-monmap being happy
+        echo "[$ip]"
+        ;;
+      *)
+        grep -o "$IPV4_REGEXP" /proc/net/fib_trie | grep -vEw "^127|255$|0$" | head -1
+        ;;
+    esac
+  fi
+}
+
+function get_network {
+  # IPv4 is the default unless we specify it
+  IP_LEVEL=${1:-4}
+  if command -v ip &>/dev/null; then
+      ip -$IP_LEVEL route show dev $NIC_MORE_TRAFFIC | grep proto | awk '{ print $1 }'
+      return
+  fi
+
+  case "$IP_LEVEL" in
+    6)
+      line=$(grep $NIC_MORE_TRAFFIC /proc/1/task/1/net/ipv6_route | grep -v '^ff')
+      base=$(echo $line | awk '{ print $1 }')
+      base=$(flat_to_ipv6 $base)
+      mask=$(echo $line | awk '{ print $2 }')
+      echo "$base/$((16#$mask))"
+      ;;
+    *)
+      grep -o "$IPV4_NETWORK_REGEXP" /proc/net/fib_trie | grep -vE "^127|^0" | head -1
+      ;;
+  esac
+}
 
 function start_mon {
   if [[ ${NETWORK_AUTO_DETECT} -eq 0 ]]; then
@@ -14,28 +80,16 @@ function start_mon {
       fi
   else
     NIC_MORE_TRAFFIC=$(grep -vE "lo:|face|Inter" /proc/net/dev | sort -n -k 2 | tail -1 | awk '{ sub (":", "", $1); print $1 }')
-    if command -v ip; then
-      if [ ${NETWORK_AUTO_DETECT} -eq 1 ]; then
-        MON_IP=$(ip -6 -o a s $NIC_MORE_TRAFFIC | awk '{ sub ("/..", "", $4); print $4 }')
-        CEPH_PUBLIC_NETWORK=$(ip -6 r | grep $NIC_MORE_TRAFFIC | awk '{ print $1 }')
-        if [ -z "$MON_IP" ]; then
-          MON_IP=$(ip -4 -o a s $NIC_MORE_TRAFFIC | awk '{ sub ("/..", "", $4); print $4 }')
-          CEPH_PUBLIC_NETWORK=$(ip r | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/[0-9]\{1,2\}' | head -1)
-        fi
-      elif [ ${NETWORK_AUTO_DETECT} -eq 4 ]; then
-        MON_IP=$(ip -4 -o a s $NIC_MORE_TRAFFIC | awk '{ sub ("/..", "", $4); print $4 }')
-        CEPH_PUBLIC_NETWORK=$(ip r | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/[0-9]\{1,2\}' | head -1)
-      elif [ ${NETWORK_AUTO_DETECT} -eq 6 ]; then
-        MON_IP=$(ip -6 -o a s $NIC_MORE_TRAFFIC | awk '{ sub ("/..", "", $4); print $4 }')
-        CEPH_PUBLIC_NETWORK=$(ip r | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/[0-9]\{1,2\}' | head -1)
+    if [ ${NETWORK_AUTO_DETECT} -gt 1 ]; then
+      MON_IP=$(get_ip ${NETWORK_AUTO_DETECT})
+      CEPH_PUBLIC_NETWORK=$(get_network ${NETWORK_AUTO_DETECT})
+    else # Means -eq 1
+      MON_IP=$(get_ip 6)
+      CEPH_PUBLIC_NETWORK=$(get_network 6)
+      if [ -z "$MON_IP" ]; then
+        MON_IP=$(get_ip)
+        CEPH_PUBLIC_NETWORK=$(get_network)
       fi
-    # best effort, only works with ipv4
-    # it is tough to find the ip from the nic only using /proc
-    # so we just take on of the addresses available
-    # which is fairely safe given that containers usually have a single nic
-    else
-      MON_IP=$(grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' /proc/net/fib_trie | grep -vEw "^127|255$|0$" | head -1)
-      CEPH_PUBLIC_NETWORK=$(grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/[0-9]\{1,2\}' /proc/net/fib_trie | grep -vE "^127|^0" | head -1)
     fi
   fi
 
